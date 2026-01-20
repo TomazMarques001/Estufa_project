@@ -1,0 +1,28 @@
+version: '3.8'
+
+services:
+  codesys-observer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: Estufa_modbus_observer
+    environment:
+      - MODBUS_HOST=host.docker.internal  # Acessa localhost do host Windows/Mac
+      # Se estiver em Linux, use: 127.0.0.1 com network_mode: host
+      - MODBUS_PORT=502
+      - MODBUS_UNIT_ID=1
+    ports:
+      - "5000:5000"  # Dashboard web
+      - "502:502"    # Modbus (se quiser expor)
+    networks:
+      - greenhouse
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  greenhouse:
+    driver: bridge
