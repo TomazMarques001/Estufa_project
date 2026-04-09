@@ -1,0 +1,126 @@
+
+services:
+  mqtt-broker:
+    image: eclipse-mosquitto:2
+    container_name: mqtt-broker
+    ports:
+      - "1883:1883"   # MQTT
+      - "9001:9001"   # WebSocket (p/ IHM web, opcional)
+    volumes:
+      - ./mosquitto/config/mosquitto.conf:/mosquitto/config/mosquitto.conf
+      - ./mosquitto/data:/mosquitto/data
+      - ./mosquitto/log:/mosquitto/log
+    networks:
+      - edge-net
+    restart: unless-stopped
+
+  nodered:
+    image: nodered/node-red:latest
+    container_name: nodered
+    ports:
+      - "1880:1880"       # UI Node-RED
+    volumes:
+      - ./nodered-data:/data
+    environment:
+      - TZ=America/Sao_Paulo
+      # dentro do flow você usa hostnames:
+      # OPC UA:   opc.tcp://edgeconnector:4897
+      # MQTT:     mqtt-broker:1883
+    networks:
+      - edge-net
+    depends_on:
+      - mqtt-broker
+    restart: unless-stopped
+
+  influxdb:
+    image: influxdb:2.7
+    container_name: influxdb
+    ports:
+      - "8086:8086"
+    environment:
+      - DOCKER_INFLUXDB_INIT_MODE=setup
+      - DOCKER_INFLUXDB_INIT_USERNAME=admin
+      - DOCKER_INFLUXDB_INIT_PASSWORD=senha123
+      - DOCKER_INFLUXDB_INIT_ORG=edge
+      - DOCKER_INFLUXDB_INIT_BUCKET=plc_bucket
+      - DOCKER_INFLUXDB_INIT_ADMIN_TOKEN=seu_token_super_secreto
+    volumes:
+      - ./influx-data:/var/lib/influxdb2
+    networks:
+      - edge-net
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_SERVER_ROOT_URL=%(protocol)s://%(domain)s/
+    volumes:
+      - ./grafana-data:/var/lib/grafana
+    networks:
+      - edge-net
+    depends_on:
+      - influxdb
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./Front_app
+      dockerfile: Dockerfile
+    container_name: frontend
+    command: uvicorn app:app --host 0.0.0.0 --port 5000
+    ports:
+      - "5000:5000"  # API/Dashboard
+      - "502:502"    # Disponível para integração
+    volumes:
+    - ./Front_app:/app   
+    environment:
+      - TZ=America/Sao_Paulo
+    networks:
+      - edge-net
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+  nginx:
+      image: nginx:latest
+      container_name: nginx-proxy
+      ports:
+        - "80:80"
+        - "443:443"
+      volumes:
+        - ./nginx/conf.d:/etc/nginx/conf.d
+        - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+        - ./nginx/certs:/etc/nginx/certs:ro
+      networks:
+        - edge-net
+      depends_on:
+        - nodered
+        - grafana
+        - frontend
+        - influxdb
+      restart: unless-stopped
+  openplc:
+    image: ghcr.io/autonomy-logic/openplc-runtime:latest
+    container_name: openplc
+    ports:
+      - "8080:8080"  
+      - "8443:8443"   # Porta segura para conectar o TIA Portal (OpenPLC Editor)
+      - "5020:502"    # Porta do Modbus TCP
+    cap_add: # Permissões pro Docker rodar em Tempo Real (Real-time)
+      - SYS_NICE
+      - SYS_RESOURCE
+    volumes:
+      - ./openplc-data:/var/run/runtime
+    networks:
+      - edge-net
+    restart: unless-stopped
+networks:
+  edge-net:
+    external: true

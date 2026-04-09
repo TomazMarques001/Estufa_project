@@ -1,0 +1,17 @@
+services:
+  edgeconnector:
+    image: softingindustrial/edgeconnector-siemens:latest
+    container_name: edgeconnector
+    ports:
+      - "1443:443"   # HTTPS Web UI
+      - "8099:8099"  # HTTP Web UI (ENABLE_HTTP_CONFIG=ON)
+      - "4897:4897"  # OPC UA server do edgeconnector
+    environment:
+      - ENABLE_HTTP_CONFIG=ON
+    networks:
+      - edge-net
+    restart: unless-stopped
+
+networks:
+  edge-net:
+    external: true

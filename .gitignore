@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+# 1. A REGRA DE OURO: Bloqueia absolutamente tudo no projeto
+*
+
+# 2. EXCEÇÃO ESTRUTURAL: Permite que o Git "enxergue" os diretórios
+# (Sem isso, o Git ignora a pasta inteira e nem procura os arquivos permitidos lá dentro)
+!*/
+
+# 3. A SUA LISTA VIP: O que o Git tem permissão para salvar
+# Em vez de listar arquivo por arquivo, você libera por extensão e nomes específicos:
+!.gitignore
+!*.py
+!Dockerfile
+!docker-compose.yml
+!requirements.txt
+!*.md
