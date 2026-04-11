@@ -1,3 +1,5 @@
+Descição e funcionalidades:
+
 Esse projeto apresenta uma organização de containers focados em realizar comunicação com CLP (Controlador lógico Programavel) e disponibilizar os dados via MQQT Broker para aplicações customizaveis.
 O projeto eh divido em duas frentes, 
 EDGE-INFRA: lida com a comunicação local com o CLP SIEMENS via ETHERNET, sendo necessario acessar o objeto CLP via o IP do mesmo, tendo em vista que os SIEMENS S7 1200+ tem um servidor OPC UA nativo.
