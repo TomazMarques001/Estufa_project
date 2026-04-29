@@ -1,6 +1,6 @@
 import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
@@ -11,7 +11,7 @@ from pathlib import Path
 import os
 import httpx 
 
-from models import SensorData, Setpoints, Controls, GreenhouseState
+from models import SensorData, Setpoints, Controls, GreenhouseState, SetpointRequest
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # LOGGING
@@ -54,9 +54,61 @@ templates = Jinja2Templates(directory="templates")
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # ENDPOINTS: Node-RED → FastAPI
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+@app.post("/api/estufa/enable")
+async def set_greenhouse_enable(payload: Controls):
+    global current_state
+
+    enabled = bool(payload.greenhouse_liga)
+
+    # Atualiza estado local (UI responde na hora)
+    current_state.controls.greenhouse_liga = enabled
+    current_state.timestamp = datetime.now(timezone.utc).isoformat()
+    current_state.connected = True
+
+    # Envia pro Node-RED escrever no OpenPLC via Modbus
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.post(
+                f"{NODE_RED_URL}/api/estufa/enable",
+                json={"Liga.value": enabled}
+            )
+        if resp.status_code >= 400:
+            logger.error(f"Node-RED retornou {resp.status_code}: {resp.text}")
+            return {"status": "error", "node_red_status": resp.status_code, "detail": resp.text}
+    except Exception as e:
+        logger.error(f"Erro ao enviar enable para Node-RED: {e}")
+        return {"status": "error", "detail": str(e)}
+
+    await broadcast_state()
+    return {"status": "ok", "greenhouse_liga": enabled}
+
+
+@app.post("/api/setpoints/update")
+async def update_setpoints(data: dict):
+    """
+    Node-RED manda aqui os setpoints atuais vindos do MQTT (estufas/setpoints)
+    Ex: { "Setpoint_Umidade_solo": 60, "Setpoint_Umidade_Ar": 70, "Setpoint_temp": 25 }
+    """
+    global current_state
+
+    # Atualiza só os campos presentes
+    sp = data or {}
+    if "Setpoint_Umidade_solo" in sp:
+        current_state.setpoints.Setpoint_Umidade_solo = sp["Setpoint_Umidade_solo"]
+    if "Setpoint_Umidade_Ar" in sp:
+        current_state.setpoints.Setpoint_Umidade_Ar = sp["Setpoint_Umidade_Ar"]
+    if "Setpoint_temp" in sp:
+        current_state.setpoints.Setpoint_temp = sp["Setpoint_temp"]
+
+    current_state.timestamp = datetime.now().isoformat()
+    current_state.connected = True  # ou deixe isso só pros sensores, se preferir
+
+    await broadcast_state()
+    return {"status": "ok"}
 
 @app.post("/api/setpoint")
-async def set_setpoint(payload: dict):
+async def set_setpoint(req: SetpointRequest):
+
     """
     Frontend envia novo setpoint.
 
@@ -64,9 +116,9 @@ async def set_setpoint(payload: dict):
     {"name": "Setpoint_Umidade_solo", "value": 65}
     """
     global current_state
-
-    name = payload.get("name")
-    value = payload.get("value")
+    name = req.name
+    value = req.value
+    logger.info(f"✓ /api/setpoint name={name} value={value}")
 
     # Atualiza estado local (igual você já fazia)
     if name == "Setpoint_Umidade_solo":
@@ -76,12 +128,7 @@ async def set_setpoint(payload: dict):
     elif name == "Setpoint_temp":
         current_state.setpoints.Setpoint_temp = value
     else:
-        return {"error": f"Setpoint desconhecido: {name}"}
-    # if not hasattr(current_state.setpoints, name):
-    #   return {"error": f"Setpoint desconhecido: {name}"}
-
-    # setattr(current_state.setpoints, name, value)
-    
+        return {"error": f"Setpoint desconhecido: {name}"}   
     logger.info(f"✓ Setpoint '{name}' = {value}")
 
     # Envia ao Node-RED apenas o setpoint alterado (topic e value separados).
@@ -89,15 +136,20 @@ async def set_setpoint(payload: dict):
       "topic": name,
       "value": value
     }
-
     try:
-      async with httpx.AsyncClient(timeout=5.0) as client:
-        resp = await client.post(f"{NODE_RED_URL}/api/setpoint", json=setpoint_update)
-      logger.info(f"✓ Enviado setpoints para Node-RED: status {resp.status_code}")
-    except Exception as e:
-        logger.error(f"✗ Erro ao enviar setpoints para Node-RED: {e}")
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.post(f"{NODE_RED_URL}/api/setpoint", json=setpoint_update)
 
-    # Atualiza frontend
+        if resp.status_code >= 400:
+            logger.error(f"Node-RED retornou {resp.status_code}: {resp.text}")
+            return {"status": "error", "node_red_status": resp.status_code, "detail": resp.text}
+
+    except Exception as e:
+        logger.error(f"Erro ao enviar setpoint para Node-RED: {e}")
+        return {"status": "error", "detail": str(e)}
+
+    current_state.timestamp = datetime.now(timezone.utc).isoformat()
+    current_state.connected = True
     await broadcast_state()
 
     return {"status": "ok", "name": name, "value": value}
@@ -134,51 +186,43 @@ async def update_controls(data: Controls):
     """
     Node-RED envia estados dos atuadores aqui.
     POST /api/controls/update
-    {
-      "cooler_status": false,
-      "Aquecimento_status": true,
-      "lamp_status": false
-    }
+{  
+    "Aquecimento_status": $boolean(payload."Lampada_Cerâmica.value" ? payload."Lampada_Cerâmica.value" : false), 
+    "cooler_status": $boolean(payload."Valvula_Refri.value" ? payload."Valvula_Refri.value" : false),   
+    "irrigacao_status": $boolean(payload."Valvula_Irrig.value" ? payload."Valvula_Irrig.value":false),   
+    "lamp_status": false,
+    "greenhouse_liga":  false
+    "time_stamp":  null
+   }
     """
+    edge_dt = None
+    now_utc = datetime.now(timezone.utc)
     global current_state
     
+    if data.time_stamp:
+        try:
+            edge_dt = datetime.fromisoformat(data.time_stamp.replace("Z", "+00:00"))
+            if edge_dt.tzinfo is None:
+                edge_dt = edge_dt.replace(tzinfo=timezone.utc)
+
+            now_utc = datetime.now(timezone.utc)
+            data.latency_ms = int((now_utc - edge_dt).total_seconds() * 1000)
+            data.latency_ms = max(0, data.latency_ms)
+        except Exception as e:
+            logger.exception(f"Falha calculando latência: {e}")
+            data.latency_ms = None
     # Controls sao somente leitura no frontend e chegam apenas do Node-RED.
     current_state.controls = data
-    current_state.timestamp = datetime.now().isoformat()
+    current_state.timestamp = datetime.now(timezone.utc).isoformat()
     current_state.connected = True
-    
+
     logger.info(
-      f"✓ Controles atualizados: Cooling={data.cooler_status}, Heating={data.Aquecimento_status}, Irrigacao={data.irrigacao_status}, Lamp={data.lamp_status}"
+      f"✓ Controles atualizados: Cooling={data.cooler_status}, Heating={data.Aquecimento_status}, Irrigacao={data.irrigacao_status}, Lamp={data.lamp_status}, latency_ms={data.latency_ms} "
     )
     
     await broadcast_state()
     
     return {"status": "ok"}
-
-
-@app.post("/api/meta/update")
-async def update_meta(data: dict):
-    """
-    Node-RED envia dados de comunicação e status geral da estufa.
-    POST /api/meta/update
-    {
-      "latency_ms": 35,
-      "uptime_s": 1234,
-      "greenhouse_enabled": false,
-      "plc_status": true
-    }
-    """
-    global current_state
-
-    current_state.meta = data if data else current_state.meta
-    current_state.timestamp = datetime.now().isoformat()
-    current_state.connected = True
-
-    await broadcast_state()
-
-    return {"status": "ok", "timestamp": current_state.timestamp}
-
-
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -220,17 +264,22 @@ async def websocket_endpoint(websocket: WebSocket):
 
 
 async def broadcast_state():
-    """Envia estado atual para todos os WebSockets conectados"""
     if not active_connections:
         return
-    
+
     data = current_state.dict()
-    
-    for connection in active_connections:
+    dead = []
+
+    for ws in active_connections:
         try:
-            await connection.send_json(data)
+            await ws.send_json(data)
         except Exception as e:
-            logger.error(f"Erro ao enviar para WebSocket: {e}")
+            logger.warning(f"WebSocket fechado/removendo: {e}")
+            dead.append(ws)
+
+    for ws in dead:
+        if ws in active_connections:
+            active_connections.remove(ws)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -261,6 +310,7 @@ body {
   overflow: hidden;
 }
 
+
 .screen {
   width: 100%;
   height: 100%;
@@ -275,6 +325,7 @@ body {
     "ctrl   clima   clima";
   gap: 12px;
 }
+
 
 .block {
   background: #262626;
@@ -298,6 +349,7 @@ body {
   margin-bottom: 8px;
 }
 
+
 .line {
   display: flex;
   justify-content: space-between;
@@ -306,16 +358,20 @@ body {
   padding: 6px 0;
 }
 
+
 .value {
   font-size: 1.3rem;
   font-weight: bold;
   color: #4caf50;
 }
 
+
+
 .toggle.disabled {
-  opacity: 0.45;
-  pointer-events: none;
-  filter: grayscale(0.5);
+  opacity: 0.35;
+  filter: grayscale(1);
+  border-color: rgba(255,255,255,0.08);
+
 }
 
 .set {
@@ -329,10 +385,12 @@ body {
   font-size: 0.95rem;
 }
 
+
 .set:focus {
   outline: 2px solid #4caf50;
   border-color: #4caf50;
 }
+
 
 .toggle {
   background: #444;
@@ -344,25 +402,34 @@ body {
   user-select: none;
   transition: all 0.3s;
   border: 2px solid transparent;
+  pointer-events: none;
 }
+
 
 .toggle:hover {
   border-color: #666;
 }
+
 
 .toggle.on {
   background: #3fa33f;
   color: #fff;
 }
 
+
 .toggle.off {
   background: #a33f3f;
   color: #fff;
 }
 
+
 .chart-container {
   height: 120px;
   margin: 8px 0;
+}
+.block-clima .chart-container {
+  height: calc(100% - 36px); /* tira espaço da linha "Janela" */
+  margin: 0;
 }
 
 .status-bar {
@@ -374,13 +441,41 @@ body {
   text-align: center;
 }
 
+
 .status-bar.connected {
   color: #4caf50;
 }
 
+
 .status-bar.disconnected {
   color: #f44336;
 }
+
+
+.greenhouse-label {
+  margin-top: 10px;
+  padding: 12px 10px;
+  border-radius: 10px;
+  text-align: center;
+  font-size: 1.05rem;
+  font-weight: bold;
+  letter-spacing: 0.5px;
+}
+
+
+.greenhouse-label.on {
+  background: #16a34a;
+  color: #ffffff;
+}
+.greenhouse-label {
+  cursor: pointer;
+  user-select: none;
+}
+.greenhouse-label.off {
+  background: #3f3f46;
+  color: #e4e4e7;
+}
+
 
 /* Bloco de eventos: texto um pouco menor */
 .events-text {
@@ -405,6 +500,7 @@ body {
     </div>
   </div>
 
+
   <!-- BLOCO 2: Umidade do Ar -->
   <div class="block block-ar">
     <div class="title">💨 Umidade do Ar</div>
@@ -419,10 +515,11 @@ body {
     </div>
   </div>
 
-  <!-- BLOCO 3: Temperatura do Solo -->
+
+  <!-- BLOCO 3: Temperatura Atual -->
   <div class="block block-temp">
-    <div class="title">🌡️ Temperatura do Solo</div>
-    <div class="chart-container"><canvas id="chartTempSolo"></canvas></div>
+    <div class="title">🌡️ Temperatura Atual</div>
+    <div class="chart-container"><canvas id="chartTempAtual"></canvas></div>
     <div class="line">
       <span>Atual</span>
       <span class="value" id="tempSoloValue">--</span>
@@ -433,9 +530,11 @@ body {
     </div>
   </div>
 
+
 <!-- BLOCO 4: Controles -->
 <div class="block block-controles">
   <div class="title">⚙️ Controles</div>
+
 
   <div class="line">
     <span>Refrigeração</span>
@@ -444,12 +543,14 @@ body {
     </div>
   </div>
 
+
   <div class="line">
     <span>Aquecimento</span>
     <div style="display:flex; flex-direction:column; align-items:flex-end; gap:4px;">
       <div class="toggle off" id="toggleHeating">Desligado</div>
     </div>
   </div>
+
 
   <div class="line">
     <span>Irrigação</span>
@@ -458,6 +559,7 @@ body {
     </div>
   </div>
 
+
   <div class="line">
     <span>Lâmpada</span>
     <div style="display:flex; flex-direction:column; align-items:flex-end; gap:4px;">
@@ -465,27 +567,33 @@ body {
     </div>
   </div>
 
+
   <div class="status-bar" id="statusBar">● Conectando...</div>
+
+
+  <div id="greenhouseLabel" class="greenhouse-label off">ESTUFA DESLIGADA</div>
+
 
   <div style="margin-top:10px; display:grid; grid-template-columns:1fr 1fr; gap:8px;">
     <div style="background:#333; padding:8px; border-radius:8px; font-size:0.8rem;">
-      <div style="color:#999;">Latência</div>
-      <div id="statusLatency">-- ms</div>
+      <div style="color:#999;">Ult. atualizacao</div>
+      <div id="statusLastUpdate">--</div>
     </div>
     <div style="background:#333; padding:8px; border-radius:8px; font-size:0.8rem;">
-      <div style="color:#999;">Uptime</div>
-      <div id="statusUptime">--</div>
+      <div style="color:#999;">Origem</div>
+      <div id="statusSource">Node-RED/MQTT</div>
     </div>
   <div style="background:#333; padding:8px; border-radius:8px; font-size:0.8rem;">
-    <div style="color:#999;">Estufa</div>
-    <div id="statusGreenhouse">--</div>
+    <div style="color:#999;">Latência</div>
+    <div id="statusLatency"></div>
   </div>
     <div style="background:#333; padding:8px; border-radius:8px; font-size:0.8rem;">
-      <div style="color:#999;">CLP</div>
-      <div id="statusPlc">--</div>
+      <div style="color:#999;">Modo</div>
+      <div id="statusMode">Somente leitura</div>
     </div>
   </div>
 </div>
+
 
   <!-- BLOCO 5: Tendências & Últimos Eventos (NOVA PARTE) -->
   <div class="block block-eventos">
@@ -508,6 +616,7 @@ body {
     </div>
   </div>
 
+
   <!-- BLOCO 6: Clima da Estufa (NOVA PARTE) -->
   <div class="block block-clima">
     <div class="title">🌤️ Clima da Estufa</div>
@@ -519,14 +628,17 @@ body {
   </div>
 </div>
 
+
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 <script>
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // GRÁFICOS
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+
 const chartInstances = {};
 let climateChart = null;
+
 
 function createChart(id, label) {
   const ctx = document.getElementById(id).getContext('2d');
@@ -549,33 +661,36 @@ function createChart(id, label) {
       maintainAspectRatio: false,
       scales: {
         x: { display: false },
-        y: { 
+        y: {
           display: true,
           grid: { color: 'rgba(255,255,255,0.1)' },
           ticks: { color: '#999', font: { size: 10 } }
         }
       },
       plugins: {
-        legend: { display: false }
+        legend: { 
+          display: false }
       }
     }
   });
 }
 
+
 function updateChart(id, value) {
   const chart = chartInstances[id];
   if (!chart) return;
-  
+ 
   chart.data.labels.push(new Date().toLocaleTimeString());
   chart.data.datasets[0].data.push(value);
-  
+ 
   if (chart.data.labels.length > 30) {
     chart.data.labels.shift();
     chart.data.datasets[0].data.shift();
   }
-  
+ 
   chart.update('none');
 }
+
 
 // Clima da estufa: 3 variáveis no mesmo gráfico
 function createClimateChart() {
@@ -620,7 +735,7 @@ function createClimateChart() {
       maintainAspectRatio: false,
       scales: {
         x: { display: false },
-        y: { 
+        y: {
           position: 'left',
           grid: { color: 'rgba(255,255,255,0.1)' },
           ticks: { color: '#999', font: { size: 10 } }
@@ -632,50 +747,60 @@ function createClimateChart() {
         }
       },
       plugins: {
-        legend: {
+        legend: { 
           display: true,
-          labels: { color: '#ccc', font: { size: 9 } }
+          position: 'top',
+        labels: {
+          boxWidth: 10,
+          boxHeight: 10,
+          padding: 8,
+        font: { size: 24 } }
         }
       }
     }
   });
 }
 function setToggleEnabled(elementId, enabled) {
-  const element = document.getElementById(elementId);
-  if (!element) return;
+ // const element = document.getElementById(elementId);
+ // if (!element) return;
+  //element.classList.add("disabled");
+  //element.title = enabled ? "" : "Estufa desligada";
+    const el = document.getElementById(elementId);
+  if (!el) return;
 
-  if (enabled) {
-    element.classList.remove("disabled");
-    element.title = "";
-  } else {
-    element.classList.add("disabled");
-    element.title = "Estufa desligada";
-  }
+  // só visual: quando estufa desligada, deixa "apagado"
+  el.classList.toggle("disabled", !enabled);
 }
 
-function updateClimateChart(soilHum, airHum, soilTemp) {
+
+function updateClimateChart(soilHum, airHum, atualTemp) {
   if (!climateChart) return;
   const label = new Date().toLocaleTimeString();
   const data = climateChart.data;
 
+
   data.labels.push(label);
   data.datasets[0].data.push(soilHum);
   data.datasets[1].data.push(airHum);
-  data.datasets[2].data.push(soilTemp);
+  data.datasets[2].data.push(atualTemp);
+
 
   if (data.labels.length > 30) {
     data.labels.shift();
     data.datasets.forEach(ds => ds.data.shift());
   }
 
+
   climateChart.update('none');
 }
+
 
 // Inicializa gráficos
 createChart('chartSolo', 'Umidade do Solo');
 createChart('chartAr', 'Umidade do Ar');
-createChart('chartTempSolo', 'Temperatura do Solo');
+createChart('chartTempAtual', 'Temperatura Atual');
 createClimateChart();
+
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // WEBSOCKET
@@ -683,7 +808,9 @@ createClimateChart();
 
 let lastControls = null;
 
+
 const ws = new WebSocket("ws://" + window.location.host + "/ws/live");
+
 
 ws.onopen = () => {
   console.log("✓ WebSocket conectado");
@@ -691,9 +818,10 @@ ws.onopen = () => {
   document.getElementById("statusBar").textContent = "● Conectado";
 };
 
+
 ws.onmessage = (event) => {
   const data = JSON.parse(event.data);
-  
+ 
   // Status
   const statusBar = document.getElementById("statusBar");
   if (data.connected) {
@@ -703,49 +831,58 @@ ws.onmessage = (event) => {
     statusBar.className = "status-bar disconnected";
     statusBar.textContent = "● Desconectado";
   }
-  
-  const meta = data.meta || {};
+ 
   const controls = data.controls || {};
-  const greenhouseEnabled = meta.greenhouse_enabled ?? false;
+  const greenhouseEnabled = controls.greenhouse_liga ?? false;
 
-  document.getElementById("statusGreenhouse").textContent =
-    greenhouseEnabled ? "Ligada" : "Desligada";
+
+  const greenhouseLabel = document.getElementById("greenhouseLabel");
+  greenhouseLabel.textContent = greenhouseEnabled ? "ESTUFA LIGADA" : "ESTUFA DESLIGADA";
+  greenhouseLabel.classList.toggle("on", greenhouseEnabled);
+  greenhouseLabel.classList.toggle("off", !greenhouseEnabled);
+
 
   setToggleEnabled("toggleCooling", greenhouseEnabled);
   setToggleEnabled("toggleHeating", greenhouseEnabled);
   setToggleEnabled("toggleIrrigation", greenhouseEnabled);
   setToggleEnabled("toggleLamp", greenhouseEnabled);
 
-  if (meta.latency_ms != null) {
-    document.getElementById("statusLatency").textContent = meta.latency_ms + " ms";
+
+  if (data.timestamp) {
+    document.getElementById("statusLastUpdate").textContent = new Date(data.timestamp).toLocaleTimeString();
   }
 
-  if (meta.uptime_s != null) {
-    document.getElementById("statusUptime").textContent = meta.uptime_s + " s";
+
+  if (controls.latency_ms != null) {
+  document.getElementById("statusLatency").textContent = `${controls.latency_ms} ms`;
+  } else {
+  document.getElementById("statusLatency").textContent = `-- ms`;
   }
 
-  if (meta.plc_status != null) {
-    document.getElementById("statusPlc").textContent = meta.plc_status ? "OK" : "Falha";
-  }
-    
+  document.getElementById("statusSource").textContent = "Node-RED/Modbus";
+
+  document.getElementById("statusMode").textContent = greenhouseEnabled ? "Controle habilitado" : "Somente leitura";
+   
   // ━━ Sensores
   const sensors = data.sensors || {};
-  
+ 
   const soilHum = sensors.Umidade_solo || 0;
   const airHum = sensors.Umidade_Ar || 0;
-  const soilTemp = sensors.Temperatura_Atual || 0;
+  const atualTemp = sensors.Temperatura_Atual || 0;
+
 
   document.getElementById("soloValue").textContent = soilHum.toFixed(1) + "%";
   updateChart('chartSolo', soilHum);
-  
+ 
   document.getElementById("arValue").textContent = airHum.toFixed(1) + "%";
   updateChart('chartAr', airHum);
-  
-  document.getElementById("tempSoloValue").textContent = soilTemp.toFixed(1) + "°C";
-  updateChart('chartTempSolo', soilTemp);
+ 
+  document.getElementById("tempSoloValue").textContent = atualTemp.toFixed(1) + "°C";
+  updateChart('chartTempAtual', atualTemp);
 
-  updateClimateChart(soilHum, airHum, soilTemp);
-  
+
+  updateClimateChart(soilHum, airHum, atualTemp);
+ 
   // ━━ Setpoints
   const setpoints = data.setpoints || {};
   if (setpoints.Setpoint_Umidade_solo != null) {
@@ -757,19 +894,22 @@ ws.onmessage = (event) => {
   if (setpoints.Setpoint_temp != null) {
     document.getElementById("tempSoloSp").value = setpoints.Setpoint_temp.toFixed(1);
   }
-  
+ 
   // ━━ Controles
   updateToggle("toggleCooling", controls.cooler_status);
   updateToggle("toggleHeating", controls.Aquecimento_status);
   updateToggle("toggleIrrigation", controls.irrigacao_status);
   updateToggle("toggleLamp", controls.lamp_status);
 
+
   updateLastEvents(controls, data);
 };
+
 
 ws.onerror = (error) => {
   console.error("✗ Erro WebSocket:", error);
 };
+
 
 ws.onclose = () => {
   console.log("✗ WebSocket desconectado");
@@ -778,9 +918,22 @@ ws.onclose = () => {
   setTimeout(() => location.reload(), 5000);
 };
 
+
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // CONTROLES
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+document.getElementById("greenhouseLabel").addEventListener("click", () => {
+  // pega estado atual do label (se está "on", vai desligar; se está "off", vai ligar)
+  const isOn = document.getElementById("greenhouseLabel").classList.contains("on");
+  const next = !isOn;
+
+  fetch("/api/estufa/enable", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ greenhouse_liga: next })
+  });
+});
 
 function updateToggle(elementId, state) {
   const element = document.getElementById(elementId);
@@ -795,9 +948,11 @@ function updateToggle(elementId, state) {
   }
 }
 
+
 // Últimos eventos de atuadores + alarmes
 function updateLastEvents(controls, data) {
   const now = new Date().toLocaleTimeString();
+
 
   if (lastControls) {
     if (!lastControls.cooler_status && controls.cooler_status) {
@@ -813,13 +968,16 @@ function updateLastEvents(controls, data) {
     }
   }
 
+
   // Se no futuro você mandar alarmes pelo backend:
   if (data.last_alarm) {
     document.getElementById("lastAlarm").textContent = data.last_alarm;
   }
 
+
   lastControls = { ...controls };
 }
+
 
 // Setpoints
 document.getElementById("soloSp").addEventListener("change", (e) => {
@@ -831,6 +989,7 @@ document.getElementById("soloSp").addEventListener("change", (e) => {
   });
 });
 
+
 document.getElementById("arSp").addEventListener("change", (e) => {
   const value = parseFloat(e.target.value);
   fetch("/api/setpoint", {
@@ -839,6 +998,7 @@ document.getElementById("arSp").addEventListener("change", (e) => {
     body: JSON.stringify({ name: "Setpoint_Umidade_Ar", value: value })
   });
 });
+
 
 document.getElementById("tempSoloSp").addEventListener("change", (e) => {
   const value = parseFloat(e.target.value);

@@ -28,8 +28,8 @@ services:
       # MQTT:     mqtt-broker:1883
     networks:
       - edge-net
-    depends_on:
-      - mqtt-broker
+    # depends_on:
+    #   - mqtt-broker
     restart: unless-stopped
 
   influxdb:
@@ -110,9 +110,9 @@ services:
     image: ghcr.io/autonomy-logic/openplc-runtime:latest
     container_name: openplc
     ports:
-      - "8080:8080"  
       - "8443:8443"   # Porta segura para conectar o TIA Portal (OpenPLC Editor)
       - "5020:502"    # Porta do Modbus TCP
+      - "9800:9800"  # <--- ESSA É A PORTA DO DEBUGGER
     cap_add: # Permissões pro Docker rodar em Tempo Real (Real-time)
       - SYS_NICE
       - SYS_RESOURCE
@@ -121,6 +121,7 @@ services:
     networks:
       - edge-net
     restart: unless-stopped
+    
 networks:
   edge-net:
     external: true
